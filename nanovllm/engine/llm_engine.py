@@ -2,7 +2,7 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.is_vl = config.is_vl
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -28,7 +29,11 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        if self.is_vl:
+            self.processor = AutoProcessor.from_pretrained(config.model)
+            self.tokenizer = self.processor.tokenizer
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -39,10 +44,34 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+    def add_request(
+        self,
+        prompt: str | list[int] | list[dict],
+        sampling_params: SamplingParams,
+        images: list | None = None,
+    ):
+        pixel_values = None
+        image_grid_thw = None
+
+        if self.is_vl and isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+            # Chat messages format: [{"role": "user", "content": [{"type": "image", ...}, ...]}]
+            text = self.processor.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+            inputs = self.processor(
+                text=[text],
+                images=images,
+                videos=None,
+                return_tensors="pt",
+            )
+            token_ids = inputs["input_ids"].squeeze(0).tolist()
+            if "pixel_values" in inputs:
+                pixel_values = inputs["pixel_values"]
+                image_grid_thw = inputs["image_grid_thw"].tolist()
+        elif isinstance(prompt, str):
+            token_ids = self.tokenizer.encode(prompt)
+        else:
+            token_ids = prompt
+
+        seq = Sequence(token_ids, sampling_params, pixel_values, image_grid_thw)
         self.scheduler.add(seq)
 
     def step(self):
@@ -58,16 +87,19 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[list[dict]],
         sampling_params: SamplingParams | list[SamplingParams],
+        images: list | None = None,
         use_tqdm: bool = True,
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        if images is None:
+            images = [None] * len(prompts)
+        for prompt, sp, imgs in zip(prompts, sampling_params, images):
+            self.add_request(prompt, sp, imgs)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
